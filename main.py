@@ -3,8 +3,11 @@ import hashlib
 import argparse
 import sqlite3
 import logging
+import sys
 
-# bullmq?
+EXIT_UNEXPECTED = 1
+EXIT_FILE_ERROR = 2
+EXIT_DB_ERROR = 3
 
 class FileScanner:
     @staticmethod
@@ -18,7 +21,7 @@ class FileScanner:
             full_path = os.path.join(path, file_name)
             if os.path.isdir(full_path):
                 if recursive:
-                    scanned_files += FileScanner.scan(full_path)
+                    scanned_files.extend(FileScanner.scan(full_path))
             else:
                 scanned_files.append(full_path)
         
@@ -30,20 +33,26 @@ class FileHasher:
         if algorithm.lower() in ("md5", "sha1", "sha256"):
            self.algorithm = algorithm.lower()
         else:
-            print("INFO: Invalid hashing algorithm type, defaulting to md5")
+            logging.warning("Invalid hashing algorithm type %s, defaulting to md5", algorithm)
             self.algorithm = "md5"
     
-    def quick_hash(self, file_path: str, hashing_chunk_size: int = 1_048_576) -> str:
+    def quick_hash(self, file_path: str, hashing_chunk_size: int = 1_048_576) -> str | None:
         """
         Hashes chunk of file in **file_path** provided by loading chunk of size specified with **hashing_chunk_size**.
         **Returns** hash of specified type in form of **str**.
         """
 
         hasher = hashlib.new(self.algorithm)
+        try:
+            with open(file_path, "rb") as f:
+                hasher.update(f.read(hashing_chunk_size))
+        except PermissionError:
+            logging.warning("Permission denied for %s, excluding file from list", file_path)
+            return None
+        except Exception as e:
+            logging.warning("Unexpected error while reading %s: %s", file_path, e)
+            return None
 
-        with open(file_path, "rb") as f:
-            hasher.update(f.read(hashing_chunk_size))
-        
         return hasher.hexdigest()
     
     def full_hash(self, file_path: str, chunk_size: int = 1_048_576) -> str:
@@ -76,14 +85,14 @@ class Database:
 
         self.con.commit()
 
-    def insert(self, files: list[str, str, int, bool]) -> None:
+    def insert(self, files: list[tuple[str, str, int, bool]]) -> None:
         self.cur.executemany(
             "INSERT INTO files (file_path, hash, file_size, source) VALUES (?, ?, ?, ?)",
             files
         )
         self.con.commit()
     
-    def find_dupes(self) -> list[(str, str)]:
+    def find_dupes(self) -> list[tuple[str, str]]:
         self.cur.execute("""
             SELECT
                 s.file_path AS source_path,
@@ -108,34 +117,67 @@ class Controller:
         self.hash_mode = hash_mode
         self.delete = delete
 
+    def _hash_files(self, file_list, hasher_func, source_flag):
+        results = []
+        for path in file_list:
+            hash_val = hasher_func(path)
+            if not hash_val:
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError as e:
+                logging.warning("Cannot get size of %s: %s", path, e)
+                continue
+            results.append((path, hash_val, size, source_flag))
+        return results
+
+
     def run(self):
+        logging.info("Starting duplicate scan")
+        
         try:
             source_files = FileScanner.scan(self.source_dir)
             target_files = FileScanner.scan(self.target_dir)
+            logging.info("Found %d files in source dir and %d files in target dir", len(source_files), len(target_files))
         except FileNotFoundError as e:
-            print(f"Error: {e}")
-            return
+            logging.critical("Directory error: %s", e)
+            sys.exit(EXIT_FILE_ERROR)
         except Exception as e:
-            print(f"Unexpected error: {e}")
-            return
+            logging.critical("Unexpected error: %s", e)
+            sys.exit(EXIT_UNEXPECTED)
 
         hasher = FileHasher(self.hashing_algorithm)
         hf = hasher.quick_hash if self.hash_mode == "quick" else hasher.full_hash
 
-        hashed_source_files = [(path, hf(path), os.path.getsize(path), True) for path in source_files]
-        hashed_target_files = [(path, hf(path), os.path.getsize(path), False) for path in target_files]
+        hashed_source_files = self._hash_files(source_files, hf, True)
+        hashed_target_files = self._hash_files(target_files, hf, False)
+
 
         connection = sqlite3.connect(":memory:")
         db = Database(connection)
-        db.insert(hashed_source_files)
-        db.insert(hashed_target_files)
+        
+        try:
+            db.insert(hashed_source_files)
+            db.insert(hashed_target_files)
+            logging.info("Inserted %d records into memory DB", len(source_files) + len(target_files))
+        except Exception as e:
+            logging.critical("Insertion into DB was unsuccessful: %s", e)
+            sys.exit(EXIT_DB_ERROR)
 
-        duplicates = db.find_dupes()
+        try:
+            duplicates = db.find_dupes()
+        except Exception as e:
+            logging.critical("Exececution of DB query was unsuccessful: %s", e)
+            sys.exit(EXIT_DB_ERROR)
 
         for source_path, target_path in duplicates:
-            print(f"Duplicate: {source_path} <-> {target_path}")
+            logging.info("Duplicate: %s <-> %s", source_path, target_path)
+
             if self.delete or input("Delete second file? (y/N): ").lower() == "y":
-                os.remove(target_path)
+                try:
+                    os.remove(target_path)
+                except Exception as e:
+                    logging.error("Failed to delete %s: %s", target_path, e)
 
 
 
@@ -148,6 +190,12 @@ if __name__ == "__main__":
     parser.add_argument("--delete", "-d", action="store_true", help="Automatically deletes duplicates from target (no prompt)")
 
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler()]
+    )
 
     app = Controller(args.source, args.target, args.algo, args.hash_mode, args.delete)
     app.run()

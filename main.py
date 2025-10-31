@@ -4,6 +4,7 @@ import argparse
 import sqlite3
 import logging
 import sys
+from dataclasses import dataclass
 
 EXIT_UNEXPECTED = 1
 EXIT_FILE_ERROR = 2
@@ -87,7 +88,7 @@ class Database:
 
     def insert(self, files: list[tuple[str, str, int, bool]]) -> None:
         self.cur.executemany(
-            "INSERT INTO files (file_path, hash, file_size, source) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO files (file_path, hash, file_size, source) VALUES (?, ?, ?, ?)",
             files
         )
         self.con.commit()
@@ -107,15 +108,29 @@ class Database:
         """)
         return self.cur.fetchall()
 
+    def count(self) -> int:
+        return self.cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+
+
+@dataclass
+class Config:
+    source: str
+    target: str
+    hashing_algo: str
+    hashing_mode: str
+    delete: bool
+    quiet: bool
+
 
 
 class Controller:
-    def __init__(self, source_dir: str, target_dir: str, hashing_algorithm: str = "md5", hash_mode = "quick", delete: bool = False) -> None:
-        self.source_dir = source_dir
-        self.target_dir = target_dir
-        self.hashing_algorithm = hashing_algorithm
-        self.hash_mode = hash_mode
-        self.delete = delete
+    def __init__(self, config: Config) -> None: 
+        self.source_dir = config.source
+        self.target_dir = config.target
+        self.hashing_algorithm = config.hashing_algo
+        self.hashing_mode = config.hashing_mode
+        self.delete = config.delete
 
     def _hash_files(self, file_list, hasher_func, source_flag):
         results = []
@@ -147,7 +162,7 @@ class Controller:
             sys.exit(EXIT_UNEXPECTED)
 
         hasher = FileHasher(self.hashing_algorithm)
-        hf = hasher.quick_hash if self.hash_mode == "quick" else hasher.full_hash
+        hf = hasher.quick_hash if self.hashing_mode == "quick" else hasher.full_hash
 
         hashed_source_files = self._hash_files(source_files, hf, True)
         hashed_target_files = self._hash_files(target_files, hf, False)
@@ -159,7 +174,10 @@ class Controller:
         try:
             db.insert(hashed_source_files)
             db.insert(hashed_target_files)
-            logging.info("Inserted %d records into memory DB", len(source_files) + len(target_files))
+
+            files_count = db.count()
+
+            logging.info("Inserted %d records into memory DB", files_count)
         except Exception as e:
             logging.critical("Insertion into DB was unsuccessful: %s", e)
             sys.exit(EXIT_DB_ERROR)
@@ -171,9 +189,7 @@ class Controller:
             sys.exit(EXIT_DB_ERROR)
 
         for source_path, target_path in duplicates:
-            logging.info("Duplicate: %s <-> %s", source_path, target_path)
-
-            if self.delete or input("Delete second file? (y/N): ").lower() == "y":
+            if self.delete or input(f"[INFO]\tDuplicate: {source_path} <-> {target_path}\n[INPUT]\tDelete second file? (y/N): ").lower() == "y":
                 try:
                     os.remove(target_path)
                 except Exception as e:
@@ -185,17 +201,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and handle duplicate files between two directories.")
     parser.add_argument("--source", "-s", required=True, help="Source dir path")
     parser.add_argument("--target", "-t", required=True, help="Target dir path")
-    parser.add_argument("--algo", "-a", choices=["md5", "sha1", "sha256"], default="md5", help="Hashing algorithm")
-    parser.add_argument("--hash_mode", "-m", choices=["full", "quick"], default="quick", help="Hashing full file or first MiB")
+    parser.add_argument("--hashing_algo", "-a", choices=["md5", "sha1", "sha256"], default="md5", help="Hashing algorithm")
+    parser.add_argument("--hashing_mode", "-m", choices=["full", "quick"], default="quick", help="Hashing full file or first MiB")
     parser.add_argument("--delete", "-d", action="store_true", help="Automatically deletes duplicates from target (no prompt)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Runs with only essencial logs.")
 
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.CRITICAL if args.quiet else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.StreamHandler()]
     )
 
-    app = Controller(args.source, args.target, args.algo, args.hash_mode, args.delete)
+    config = Config(**vars(args))
+
+    app = Controller(config)
     app.run()

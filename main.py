@@ -189,7 +189,8 @@ class Controller:
             sys.exit(EXIT_DB_ERROR)
 
         for source_path, target_path in duplicates:
-            if self.delete or input(f"[INFO]\tDuplicate: {source_path} <-> {target_path}\n[INPUT]\tDelete second file? (y/N): ").lower() == "y":
+            logging.info("Duplicate: %s <-> %s", source_path, target_path)
+            if self.delete or input(f"[INPUT]\tDelete second file? (y/N): ").lower() == "y":
                 try:
                     os.remove(target_path)
                 except Exception as e:
